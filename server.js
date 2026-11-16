@@ -54,11 +54,7 @@ async function fetchApi(url) {
         throw error;
       }
       try { await response.body?.cancel(); } catch {}
-      return {
-        _isDirectFile: true,
-        _contentType: contentType,
-        _url: url
-      };
+      return { _isDirectFile: true, _contentType: contentType, _url: url };
     }
 
     const bodyText = await response.text();
@@ -86,15 +82,9 @@ app.post("/api/download/:platform", async (req, res) => {
   const platform = String(req.params.platform || "").toLowerCase();
   const { url, quality = "auto" } = req.body || {};
 
-  if (!["facebook", "youtube", "spotify"].includes(platform)) {
-    return res.status(404).json({ error: "Unsupported platform." });
-  }
-  if (typeof url !== "string" || !isHttpUrl(url)) {
-    return res.status(400).json({ error: "Please enter a valid http or https URL." });
-  }
-  if (!isAllowedPlatform(url, platform)) {
-    return res.status(400).json({ error: `Please enter a valid ${platform} link.` });
-  }
+  if (!["facebook", "youtube", "spotify"].includes(platform)) return res.status(404).json({ error: "Unsupported platform." });
+  if (typeof url !== "string" || !isHttpUrl(url)) return res.status(400).json({ error: "Please enter a valid URL." });
+  if (!isAllowedPlatform(url, platform)) return res.status(400).json({ error: `Please enter a valid ${platform} link.` });
 
   try {
     let endpoint;
@@ -109,24 +99,18 @@ app.post("/api/download/:platform", async (req, res) => {
 
     const data = await fetchApi(endpoint);
 
-    // 1. Direct File Stream (Facebook/YouTube)
+    // Facebook & YouTube Direct Stream
     if (data && data._isDirectFile) {
       const ext = platform === "spotify" ? "mp3" : "mp4";
       const proxyUrl = `/api/proxy?url=${encodeURIComponent(data._url)}&name=${encodeURIComponent(platform + "-file." + ext)}`;
-      return res.json({
-        ok: true,
-        platform,
-        result: { download_url: proxyUrl, type: data._contentType }
-      });
+      return res.json({ ok: true, platform, result: { download_url: proxyUrl, type: data._contentType } });
     }
 
-    // 2. Spotify JSON (May image, name, artist, at download)
+    // Spotify JSON Response
     if (platform === "spotify" && data && data.download) {
+      // Absolute URL ng audio file
       const fullAudioUrl = data.download.startsWith("http") ? data.download : `${API_BASE}${data.download}`;
-      
-      // Dynamic na filename base sa kanta
-      const safeTitle = (data.name || "spotify-audio").replace(/[^a-z0-9]/gi, '_');
-      const finalFilename = `${safeTitle}.mp3`;
+      const safeTitle = (data.name || "spotify-audio").replace(/[^a-z0-9]/gi, '_') + ".mp3";
 
       return res.json({
         ok: true,
@@ -134,9 +118,10 @@ app.post("/api/download/:platform", async (req, res) => {
         result: {
           title: data.name || "Unknown Title",
           artist: data.artist || "Unknown Artist",
-          album: data.album || "",
           cover: data.image || null,
-          download_url: `/api/proxy?url=${encodeURIComponent(fullAudioUrl)}&name=${encodeURIComponent(finalFilename)}`
+          // IPAPADALA NATIN ANG DIREKTANG LINK (WALANG PROXY)
+          download_url: fullAudioUrl,
+          filename: safeTitle
         }
       });
     }
@@ -144,67 +129,45 @@ app.post("/api/download/:platform", async (req, res) => {
     res.json({ ok: true, platform, result: data });
   } catch (error) {
     console.error(`[${platform}]`, error.message);
-    res.status(error.status || 502).json({
-      error: error.name === "AbortError"
-        ? "The downloader API took too long to respond. Please try again."
-        : (error.message || "The downloader API is temporarily unavailable.")
-    });
+    res.status(error.status || 502).json({ error: error.message || "The downloader API is temporarily unavailable." });
   }
 });
 
-// BINAGO: May tamang headers para hindi mag-fail sa Spotify CDN
+// PROXY PARA SA FACEBOOK AT YOUTUBE (Ito ang dating proxy code)
 app.get("/api/proxy", async (req, res) => {
   const targetUrl = req.query.url;
-  const filename = typeof req.query.name === "string" ? req.query.name : "download.mp3";
+  const filename = typeof req.query.name === "string" ? req.query.name : "download.mp4";
 
-  if (typeof targetUrl !== "string" || !isHttpUrl(targetUrl)) {
-    return res.status(400).json({ error: "Invalid URL." });
-  }
+  if (typeof targetUrl !== "string" || !isHttpUrl(targetUrl)) return res.status(400).json({ error: "Invalid URL." });
 
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60000);
 
-    // Dinagdag ang User-Agent at Referer para iwas-block
     const upstream = await fetch(targetUrl, { 
       signal: controller.signal,
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://open.spotify.com/"
+        "Accept": "*/*"
       }
     });
-    
     clearTimeout(timeout);
 
-    if (!upstream.ok || !upstream.body) {
-      console.error(`Proxy error: Upstream returned ${upstream.status}`);
-      return res.status(upstream.status || 502).json({ error: "Upstream failed to fetch the file." });
-    }
+    if (!upstream.ok || !upstream.body) return res.status(upstream.status || 502).json({ error: "Upstream failed." });
 
     const contentType = upstream.headers.get("content-type") || "application/octet-stream";
-    
-    // Check kung nagbalik ng JSON imbes na audio (meaning error sa API)
     if (contentType.includes("application/json")) {
-       const errText = await upstream.text();
-       console.error("Proxy received JSON instead of file:", errText);
-       return res.status(502).json({ error: "The API returned an error instead of the file. Link might be expired or blocked." });
+       return res.status(502).json({ error: "API returned an error instead of the file." });
     }
-
-    const contentLength = upstream.headers.get("content-length");
 
     res.setHeader("Content-Type", contentType);
     res.setHeader("Content-Disposition", `attachment; filename="${filename.replace(/"/g, "")}"`);
-    if (contentLength) res.setHeader("Content-Length", contentLength);
+    if (upstream.headers.get("content-length")) {
+      res.setHeader("Content-Length", upstream.headers.get("content-length"));
+    }
 
-    Readable.fromWeb(upstream.body).pipe(res).on("error", (err) => {
-      console.error("Proxy stream error:", err.message);
-      if (!res.headersSent) res.status(502).end();
-      else res.end();
-    });
+    Readable.fromWeb(upstream.body).pipe(res).on("error", () => res.end());
   } catch (error) {
-    console.error("Proxy error:", error.message);
     res.status(502).json({ error: "Proxy failed to fetch the file." });
   }
 });
