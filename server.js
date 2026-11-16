@@ -124,6 +124,10 @@ app.post("/api/download/:platform", async (req, res) => {
     if (platform === "spotify" && data && data.download) {
       const fullAudioUrl = data.download.startsWith("http") ? data.download : `${API_BASE}${data.download}`;
       
+      // Dynamic na filename base sa kanta
+      const safeTitle = (data.name || "spotify-audio").replace(/[^a-z0-9]/gi, '_');
+      const finalFilename = `${safeTitle}.mp3`;
+
       return res.json({
         ok: true,
         platform,
@@ -132,7 +136,7 @@ app.post("/api/download/:platform", async (req, res) => {
           artist: data.artist || "Unknown Artist",
           album: data.album || "",
           cover: data.image || null,
-          download_url: `/api/proxy?url=${encodeURIComponent(fullAudioUrl)}&name=${encodeURIComponent((data.name || "spotify-audio") + ".mp3")}`
+          download_url: `/api/proxy?url=${encodeURIComponent(fullAudioUrl)}&name=${encodeURIComponent(finalFilename)}`
         }
       });
     }
@@ -148,9 +152,10 @@ app.post("/api/download/:platform", async (req, res) => {
   }
 });
 
+// BINAGO: May tamang headers para hindi mag-fail sa Spotify CDN
 app.get("/api/proxy", async (req, res) => {
   const targetUrl = req.query.url;
-  const filename = typeof req.query.name === "string" ? req.query.name : "download";
+  const filename = typeof req.query.name === "string" ? req.query.name : "download.mp3";
 
   if (typeof targetUrl !== "string" || !isHttpUrl(targetUrl)) {
     return res.status(400).json({ error: "Invalid URL." });
@@ -160,14 +165,33 @@ app.get("/api/proxy", async (req, res) => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60000);
 
-    const upstream = await fetch(targetUrl, { signal: controller.signal });
+    // Dinagdag ang User-Agent at Referer para iwas-block
+    const upstream = await fetch(targetUrl, { 
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://open.spotify.com/"
+      }
+    });
+    
     clearTimeout(timeout);
 
     if (!upstream.ok || !upstream.body) {
-      return res.status(upstream.status || 502).json({ error: "Upstream failed." });
+      console.error(`Proxy error: Upstream returned ${upstream.status}`);
+      return res.status(upstream.status || 502).json({ error: "Upstream failed to fetch the file." });
     }
 
     const contentType = upstream.headers.get("content-type") || "application/octet-stream";
+    
+    // Check kung nagbalik ng JSON imbes na audio (meaning error sa API)
+    if (contentType.includes("application/json")) {
+       const errText = await upstream.text();
+       console.error("Proxy received JSON instead of file:", errText);
+       return res.status(502).json({ error: "The API returned an error instead of the file. Link might be expired or blocked." });
+    }
+
     const contentLength = upstream.headers.get("content-length");
 
     res.setHeader("Content-Type", contentType);
